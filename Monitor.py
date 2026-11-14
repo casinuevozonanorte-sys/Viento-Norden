@@ -3,6 +3,7 @@
 Abre la pagina de CARP con un navegador sin pantalla, toca el marcador Norden y
 la pestana Wind, saca una captura y lee la rosa de vientos: el color de la cuña
 indica el rango de nudos y su orientacion indica la direccion.
+Tambien avisa cuando el viento baja de 15 nudos y si el script no logra leer.
 """
 import math
 import os
@@ -17,6 +18,8 @@ TOPIC = os.environ.get("NTFY_TOPIC", "")
 TEST_NOTIFY = os.environ.get("TEST_NOTIFY") == "1"
 MIN_PIXELS = int(os.environ.get("MIN_PIXELS", "300"))
 TOL = 24
+FAIL_LIMIT = 3   # lecturas fallidas seguidas antes de avisar
+LOWS_TO_CLEAR = 2  # lecturas bajas seguidas para avisar que bajo el viento
 
 # Colores de la leyenda (aproximados, tomados de las capturas)
 BINS = {
@@ -147,37 +150,78 @@ def describe(name, mask):
     return text
 
 
+def load_state():
+    """Devuelve (estado, fallos seguidos, lecturas bajas seguidas)."""
+    try:
+        parts = open("state.txt").read().split()
+    except FileNotFoundError:
+        parts = []
+    state = parts[0] if parts and parts[0] in ("low", "high") else "low"
+    nums = [int(x) for x in parts[1:3] if x.isdigit()]
+    nums += [0] * (2 - len(nums))
+    return state, nums[0], nums[1]
+
+
+def save_state(state, fails, lows):
+    with open("state.txt", "w") as f:
+        f.write(f"{state} {fails} {lows}")
+
+
 def main():
     if TEST_NOTIFY:
         notify("Prueba: el aviso de viento funciona.")
 
-    region = capture()
-    if region is None:
-        print("No se pudo ubicar la rosa de vientos; no se cambia el estado.")
-        return
+    state, fails, lows = load_state()
 
-    result = read_rose(region)
-    print("Pixeles por rango:", {k: v[0] for k, v in result.items()})
+    try:
+        region = capture()
+    except Exception as exc:
+        print("Error al capturar:", exc)
+        region = None
 
-    active = {b: result[b][0] for b in BINS if result[b][0] >= MIN_PIXELS}
+    result, active = {}, {}
+    if region is not None:
+        result = read_rose(region)
+        print("Pixeles por rango:", {k: v[0] for k, v in result.items()})
+        active = {b: result[b][0] for b in BINS if result[b][0] >= MIN_PIXELS}
+
     dominant = max(active, key=active.get) if active else None
+
     if TEST_NOTIFY:
         if dominant:
             notify("Prueba - lectura actual: " + describe(dominant, result[dominant][1]))
         else:
             notify("Prueba: no pude leer la rosa de vientos.")
 
+    # Lectura fallida: se cuenta y se avisa una sola vez por racha
+    if dominant is None:
+        fails += 1
+        print("Lectura fallida seguida numero", fails)
+        if fails == FAIL_LIMIT:
+            notify("No puedo leer el viento del Norden desde hace unos 45 minutos. "
+                   "Revisa la pagina de CARP o el script.")
+        save_state(state, fails, lows)
+        return
+
+    fails = 0
     alert_hits = {b: n for b, n in active.items() if b in ALERT_BINS}
-    state = "high" if alert_hits else "low"
-    previous = open("state.txt").read().strip() if os.path.exists("state.txt") else "low"
 
-    if state == "high" and previous != "high":
-        best = max(alert_hits, key=alert_hits.get)
-        notify("Viento en Pilote Norden: " + describe(best, result[best][1]))
-    print("Estado:", previous, "->", state)
+    if alert_hits:
+        lows = 0
+        if state != "high":
+            best = max(alert_hits, key=alert_hits.get)
+            notify("Viento en Pilote Norden: " + describe(best, result[best][1]))
+            state = "high"
+    elif state == "high":
+        lows += 1
+        if lows >= LOWS_TO_CLEAR:
+            notify("Viento en Pilote Norden bajo de 15 nudos: ahora "
+                   + describe(dominant, result[dominant][1]))
+            state = "low"
+            lows = 0
 
-    with open("state.txt", "w") as f:
-        f.write(state)
+    print("Estado:", state, "| fallos:", fails, "| lecturas bajas:", lows)
+    save_state(state, fails, lows)
 
 
 if __name__ == "__main__":
