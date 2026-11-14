@@ -1,26 +1,27 @@
 """Avisa por ntfy cuando el viento en Pilote Norden (CARP) llega a 15 nudos o mas.
 
-Abre la pagina de CARP con un navegador sin pantalla, toca el marcador Norden,
-saca una captura y detecta el color de la rosa de vientos (los colores de la
-leyenda corresponden a rangos de nudos). Los colores se calibran con la captura.
+Abre la pagina de CARP con un navegador sin pantalla, toca el marcador Norden y
+la pestana Wind, saca una captura y lee la rosa de vientos: el color de la cuña
+indica el rango de nudos y su orientacion indica la direccion.
 """
+import math
 import os
 import urllib.request
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from playwright.sync_api import sync_playwright
 
 URL = "https://www.comisionriodelaplata.org/servicios_main.php?sid=VM"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 TEST_NOTIFY = os.environ.get("TEST_NOTIFY") == "1"
-MIN_PIXELS = int(os.environ.get("MIN_PIXELS", "600"))
-TOL = 28
+MIN_PIXELS = int(os.environ.get("MIN_PIXELS", "300"))
+TOL = 24
 
-# Colores de la leyenda (aproximados: a calibrar con la captura)
+# Colores de la leyenda (aproximados, tomados de las capturas)
 BINS = {
     "<5": (65, 125, 205),
-    "5-10": (25, 30, 70),
+    "5-10": (16, 26, 62),
     "10-15": (140, 185, 45),
     "15-20": (139, 17, 13),
     "20-25": (70, 165, 210),
@@ -28,6 +29,8 @@ BINS = {
     ">30": (232, 152, 78),
 }
 ALERT_BINS = ["15-20", "20-25", "25-30", ">30"]
+COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 
 
 def notify(msg):
@@ -60,7 +63,6 @@ def open_norden(page):
 
 
 def click_wind(page):
-    # La pestana Wind puede estar dentro de un iframe: se prueba en cada marco
     for frame in page.frames:
         try:
             frame.get_by_text("Wind", exact=True).first.click(timeout=2000)
@@ -69,6 +71,25 @@ def click_wind(page):
         except Exception:
             pass
     return False
+
+
+def locate_region(page):
+    """Zona de la pagina donde esta la rosa, tomando como guia la leyenda."""
+    for frame in page.frames:
+        try:
+            ref = frame.get_by_text("5-10 knots", exact=True).first
+            ref.wait_for(state="attached", timeout=3000)
+            box = ref.bounding_box()
+            if not box:
+                continue
+            sx = page.evaluate("window.scrollX")
+            sy = page.evaluate("window.scrollY")
+            bx, by = box["x"] + sx, box["y"] + box["height"] / 2 + sy
+            return (max(0, int(bx - 340)), max(0, int(by - 100)),
+                    int(bx - 30), int(by + 130))
+        except Exception:
+            pass
+    return None
 
 
 def capture():
@@ -80,42 +101,79 @@ def capture():
         page.wait_for_timeout(8000)
         print("Marcador Norden tocado:", open_norden(page))
         print("Pestana Wind tocada:", click_wind(page))
+        region = locate_region(page)
+        print("Rosa localizada:", region)
         page.screenshot(path="out/chart.png", full_page=True)
-        texts = ["FRAMES: " + ", ".join(f.url for f in page.frames)]
-        for frame in page.frames:
-            try:
-                texts.append(frame.inner_text("body"))
-            except Exception:
-                pass
-        with open("out/page.txt", "w", encoding="utf-8") as f:
-            f.write("\n\n".join(texts))
         browser.close()
+    return region
 
 
-def count_pixels():
-    arr = np.array(Image.open("out/chart.png").convert("RGB")).astype(int)
-    counts = {}
+def direction(mask):
+    """Angulo (grados desde el norte, horario) hacia donde apunta la cuña."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 50:
+        return None
+    pts = np.stack([xs, ys], axis=1).astype(float)
+    q = pts - pts.mean(axis=0)
+    _, vecs = np.linalg.eigh(np.cov(q.T))
+    u = vecs[:, 1]
+    t = q @ u
+    p = q @ np.array([-u[1], u[0]])
+    lo = t <= np.percentile(t, 15)
+    hi = t >= np.percentile(t, 85)
+    if p[lo].std() > p[hi].std():
+        u = -u  # el extremo angosto es el centro de la rosa
+    return math.degrees(math.atan2(u[0], -u[1])) % 360
+
+
+def read_rose(region):
+    img = Image.open("out/chart.png").convert("RGB").crop(region)
+    img.save("out/rose.png")
+    arr = np.array(img).astype(int)
+    result = {}
     for name, rgb in BINS.items():
         close = np.abs(arr - np.array(rgb)).max(axis=2) <= TOL
-        counts[name] = int(close.sum())
-    return counts
+        eroded = Image.fromarray((close * 255).astype("uint8")).filter(ImageFilter.MinFilter(3))
+        mask = np.array(eroded) > 0
+        result[name] = (int(mask.sum()), mask)
+    return result
+
+
+def describe(name, mask):
+    ang = direction(mask)
+    text = f"{name} nudos"
+    if ang is not None:
+        text += f", del {COMPASS[int(round(ang / 22.5)) % 16]}"
+    return text
 
 
 def main():
     if TEST_NOTIFY:
         notify("Prueba: el aviso de viento funciona.")
 
-    capture()
-    counts = count_pixels()
-    print("Pixeles por rango:", counts)
+    region = capture()
+    if region is None:
+        print("No se pudo ubicar la rosa de vientos; no se cambia el estado.")
+        return
 
-    high = any(counts[b] >= MIN_PIXELS for b in ALERT_BINS)
+    result = read_rose(region)
+    print("Pixeles por rango:", {k: v[0] for k, v in result.items()})
+
+    active = {b: result[b][0] for b in BINS if result[b][0] >= MIN_PIXELS}
+    dominant = max(active, key=active.get) if active else None
+    if TEST_NOTIFY:
+        if dominant:
+            notify("Prueba - lectura actual: " + describe(dominant, result[dominant][1]))
+        else:
+            notify("Prueba: no pude leer la rosa de vientos.")
+
+    alert_hits = {b: n for b, n in active.items() if b in ALERT_BINS}
+    state = "high" if alert_hits else "low"
     previous = open("state.txt").read().strip() if os.path.exists("state.txt") else "low"
-    state = "high" if high else "low"
 
     if state == "high" and previous != "high":
-        hits = [b for b in ALERT_BINS if counts[b] >= MIN_PIXELS]
-        notify(f"Viento en Pilote Norden: rango {', '.join(hits)} nudos.")
+        best = max(alert_hits, key=alert_hits.get)
+        notify("Viento en Pilote Norden: " + describe(best, result[best][1]))
     print("Estado:", previous, "->", state)
 
     with open("state.txt", "w") as f:
