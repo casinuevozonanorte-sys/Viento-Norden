@@ -1,8 +1,8 @@
 """Avisa por ntfy cuando el viento en Pilote Norden (CARP) llega a 15 nudos o mas.
 
-Abre la pagina de CARP con un navegador sin pantalla, saca una captura y
-detecta el color de la rosa de vientos (los colores de la leyenda corresponden
-a rangos de nudos). La primera corrida sirve para calibrar los colores.
+Abre la pagina de CARP con un navegador sin pantalla, toca el marcador Norden,
+saca una captura y detecta el color de la rosa de vientos (los colores de la
+leyenda corresponden a rangos de nudos). Los colores se calibran con la captura.
 """
 import os
 import urllib.request
@@ -17,7 +17,7 @@ TEST_NOTIFY = os.environ.get("TEST_NOTIFY") == "1"
 MIN_PIXELS = int(os.environ.get("MIN_PIXELS", "600"))
 TOL = 28
 
-# Colores de la leyenda (aproximados: a calibrar con la primera corrida)
+# Colores de la leyenda (aproximados: a calibrar con la captura)
 BINS = {
     "<5": (65, 125, 205),
     "5-10": (25, 30, 70),
@@ -42,15 +42,33 @@ def notify(msg):
     urllib.request.urlopen(req, timeout=20)
 
 
+def open_norden(page):
+    # Toca el marcador "Norden": el pin queda justo arriba de su etiqueta
+    for frame in page.frames:
+        try:
+            label = frame.get_by_text("Norden", exact=True).first
+            label.wait_for(state="attached", timeout=3000)
+            box = label.bounding_box()
+            if not box:
+                continue
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] - 12)
+            page.wait_for_timeout(3000)
+            return True
+        except Exception:
+            pass
+    return False
+
+
 def click_wind(page):
-    # El widget esta dentro de un iframe: se prueba en cada marco de la pagina
+    # La pestana Wind puede estar dentro de un iframe: se prueba en cada marco
     for frame in page.frames:
         try:
             frame.get_by_text("Wind", exact=True).first.click(timeout=2000)
             page.wait_for_timeout(1500)
-            return
+            return True
         except Exception:
             pass
+    return False
 
 
 def capture():
@@ -60,7 +78,8 @@ def capture():
         page = browser.new_page(viewport={"width": 1000, "height": 900})
         page.goto(URL, wait_until="networkidle", timeout=60000)
         page.wait_for_timeout(8000)
-        click_wind(page)
+        print("Marcador Norden tocado:", open_norden(page))
+        print("Pestana Wind tocada:", click_wind(page))
         page.screenshot(path="out/chart.png", full_page=True)
         texts = ["FRAMES: " + ", ".join(f.url for f in page.frames)]
         for frame in page.frames:
