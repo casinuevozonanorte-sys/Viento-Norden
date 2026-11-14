@@ -1,6 +1,6 @@
 """Avisa por ntfy cuando el viento en Pilote Norden (CARP) llega a 15 nudos o mas.
 
-Abre el widget de CARP con un navegador sin pantalla, saca una captura y
+Abre la pagina de CARP con un navegador sin pantalla, saca una captura y
 detecta el color de la rosa de vientos (los colores de la leyenda corresponden
 a rangos de nudos). La primera corrida sirve para calibrar los colores.
 """
@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 from playwright.sync_api import sync_playwright
 
-URL = "https://meteo.comisionriodelaplata.org/?w=900&h=450&lang=ES"
+URL = "https://www.comisionriodelaplata.org/servicios_main.php?sid=VM"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 TEST_NOTIFY = os.environ.get("TEST_NOTIFY") == "1"
 MIN_PIXELS = int(os.environ.get("MIN_PIXELS", "600"))
@@ -42,20 +42,27 @@ def notify(msg):
     urllib.request.urlopen(req, timeout=20)
 
 
+def click_wind(page):
+    # El widget esta dentro de un iframe: se prueba en cada marco de la pagina
+    for frame in page.frames:
+        try:
+            frame.get_by_text("Wind", exact=True).first.click(timeout=2000)
+            page.wait_for_timeout(1500)
+            return
+        except Exception:
+            pass
+
+
 def capture():
     os.makedirs("out", exist_ok=True)
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1000, "height": 700})
+        page = browser.new_page(viewport={"width": 1000, "height": 900})
         page.goto(URL, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(5000)
-        try:
-            page.get_by_text("Wind", exact=True).first.click(timeout=3000)
-            page.wait_for_timeout(1500)
-        except Exception:
-            pass
-        page.screenshot(path="out/chart.png")
-        texts = []
+        page.wait_for_timeout(8000)
+        click_wind(page)
+        page.screenshot(path="out/chart.png", full_page=True)
+        texts = ["FRAMES: " + ", ".join(f.url for f in page.frames)]
         for frame in page.frames:
             try:
                 texts.append(frame.inner_text("body"))
