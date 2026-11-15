@@ -7,6 +7,10 @@ del Club Nautico San Isidro (estacion del SMN).
 Rio: mareografo del club (ThingSpeak, alturas en cm): nivel, tendencia y picos.
 Pronostico de 12 h: Open-Meteo (modelo abierto). La previsión de creciente es un
 indicador basado en el viento previsto, no un pronostico oficial.
+
+Avisos: los eventos van al tema compartido (con el boton "Alertas SHN") y al tema
+privado (ademas con el boton "Actualizar ahora"). Las pruebas y las
+actualizaciones a pedido van solo al tema privado.
 """
 import json
 import math
@@ -19,9 +23,14 @@ from PIL import Image, ImageFilter
 from playwright.sync_api import sync_playwright
 
 # --- Configuracion general ---
-TOPIC = os.environ.get("NTFY_TOPIC", "")
+TOPIC = os.environ.get("NTFY_TOPIC", "")                   # tema compartido
+PRIVATE_TOPIC = os.environ.get("NTFY_TOPIC_PRIVATE", "")   # tema solo tuyo (con boton)
+DISPATCH_TOKEN = os.environ.get("DISPATCH_TOKEN", "")
+REPO = os.environ.get("REPO", "")
 TEST_NOTIFY = os.environ.get("TEST_NOTIFY") == "1"
+REPORT_NOW = os.environ.get("REPORT_NOW") == "1"
 STATE_FILE = "state.txt"
+SHN_URL = "https://x.com/SHN_ALERTAS"  # alertas oficiales del SHN
 FAIL_LIMIT = 3      # lecturas fallidas seguidas antes de avisar
 LOWS_TO_CLEAR = 2   # lecturas "bajas" seguidas para avisar que se normalizo
 ALERT_KNOTS = 15.0
@@ -87,17 +96,60 @@ DOWN = {
 }
 
 
-def notify(msg):
-    if not TOPIC:
-        print("Sin NTFY_TOPIC, no se envia:", msg)
+# ---------------- Avisos por ntfy ----------------
+def post(topic, msg, button=False):
+    """Publica en ntfy (JSON). Siempre agrega 'Alertas SHN'; con button=True
+    agrega tambien 'Actualizar ahora' (lleva la llave de GitHub: solo tema privado)."""
+    if not topic:
+        print("Sin tema de ntfy, no se envia:", msg)
         return
+    payload = {
+        "topic": topic,
+        "title": "Viento y río - Norden y San Isidro",
+        "message": msg,
+        "priority": 4,
+        "tags": ["wind_face"],
+    }
+    actions = []
+    if button and DISPATCH_TOKEN and REPO:
+        actions.append({
+            "action": "http",
+            "label": "Actualizar ahora",
+            "url": f"https://api.github.com/repos/{REPO}/actions/workflows/viento.yml/dispatches",
+            "method": "POST",
+            "headers": {
+                "Authorization": f"Bearer {DISPATCH_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            "body": json.dumps({"ref": "main", "inputs": {"modo": "reporte"}}),
+        })
+    actions.append({"action": "view", "label": "Alertas SHN", "url": SHN_URL})
+    payload["actions"] = actions
     req = urllib.request.Request(
-        f"https://ntfy.sh/{TOPIC}",
-        data=msg.encode("utf-8"),
-        headers={"Title": "Viento y rio - Norden y San Isidro", "Priority": "high",
-                 "Tags": "wind_face"},
+        "https://ntfy.sh",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
     )
-    urllib.request.urlopen(req, timeout=20)
+    try:
+        urllib.request.urlopen(req, timeout=20)
+    except Exception as exc:
+        print("Error al enviar a ntfy:", exc)
+
+
+def notify_alert(msg):
+    """Eventos: tema compartido y tema privado (este con 'Actualizar ahora')."""
+    post(TOPIC, msg)
+    if PRIVATE_TOPIC:
+        post(PRIVATE_TOPIC, msg, button=True)
+
+
+def notify_private(msg):
+    """Pruebas y actualizaciones a pedido: solo el tema privado."""
+    if PRIVATE_TOPIC:
+        post(PRIVATE_TOPIC, msg, button=True)
+    else:
+        post(TOPIC, msg)
 
 
 def compass(deg):
@@ -453,7 +505,7 @@ def get_surge(data):
     return {"high": bool(found), "desc": desc}
 
 
-# ---------------- Estado y avisos ----------------
+# ---------------- Estado y mensajes ----------------
 def load_state():
     state = {k: {"state": "low", "fails": 0, "lows": 0} for k in KEYS}
     try:
@@ -491,12 +543,13 @@ def surge_block(readings):
     body = r["desc"] if r else "No pude evaluarlo (sin pronóstico)."
     note = (f"Es un indicador basado en el viento previsto (del E al SSE, "
             f"{SURGE_WIND_KN:.0f} nudos o más, {SURGE_HOURS} h seguidas), no un "
-            "pronóstico oficial. Consultá las alertas del SHN.")
+            "pronóstico oficial. Las alertas oficiales del SHN están en @SHN_ALERTAS "
+            "(botón «Alertas SHN»).")
     return f"{head}\n{body}\n{note}"
 
 
-def send_full(prefix, readings, fdata):
-    """Arma el aviso completo; si es muy largo, quita la tabla hora a hora."""
+def send_full(prefix, readings, fdata, sender):
+    """Arma el mensaje completo; si es muy largo, quita la tabla hora a hora."""
     for detailed in (True, False):
         parts = [prefix, status_lines(readings), river_block(readings),
                  surge_block(readings), forecast_block(fdata, detailed)]
@@ -506,12 +559,12 @@ def send_full(prefix, readings, fdata):
     raw = msg.encode("utf-8")
     if len(raw) > MAX_MESSAGE_BYTES:
         msg = raw[:MAX_MESSAGE_BYTES].decode("utf-8", "ignore")
-    notify(msg)
+    sender(msg)
 
 
 def main():
     if TEST_NOTIFY:
-        notify("Prueba: el aviso de viento funciona.")
+        notify_private("Prueba: el aviso de viento funciona.")
 
     state = load_state()
     fdata = forecast_data()
@@ -523,7 +576,9 @@ def main():
     }
 
     if TEST_NOTIFY:
-        send_full("Prueba - mensaje completo.", readings, fdata)
+        send_full("Prueba - mensaje completo.", readings, fdata, notify_private)
+    if REPORT_NOW:
+        send_full("Actualización a pedido.", readings, fdata, notify_private)
 
     events = []
     for key in KEYS:
@@ -547,7 +602,7 @@ def main():
                 events.append(DOWN[key])
 
     if events:
-        send_full("\n".join(events), readings, fdata)
+        send_full("\n".join(events), readings, fdata, notify_alert)
 
     print("Estado:", state)
     save_state(state)
