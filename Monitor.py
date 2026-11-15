@@ -1,27 +1,39 @@
-"""Avisa por ntfy cuando el viento en Pilote Norden (CARP) llega a 15 nudos o mas.
+"""Avisa por ntfy cuando el viento en Norden (CARP) o en San Isidro (club) llega a 15 nudos.
 
-Abre la pagina de CARP con un navegador sin pantalla, toca el marcador Norden y
-la pestana Wind, saca una captura y lee la rosa de vientos: el color de la cuña
-indica el rango de nudos y su orientacion indica la direccion.
-Tambien avisa cuando el viento baja de 15 nudos y si el script no logra leer.
+Norden: abre la pagina de CARP con un navegador sin pantalla y lee la rosa de
+vientos (color = rango de nudos, orientacion = direccion).
+San Isidro: lee la ultima medicion del canal publico de ThingSpeak que usa la
+pagina del Club Nautico San Isidro (estacion del SMN).
+Cada aviso muestra las dos estaciones y el pronostico de las proximas 12 horas
+(Open-Meteo, modelo abierto).
 """
+import json
 import math
 import os
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 from PIL import Image, ImageFilter
 from playwright.sync_api import sync_playwright
 
-URL = "https://www.comisionriodelaplata.org/servicios_main.php?sid=VM"
+# --- Configuracion general ---
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 TEST_NOTIFY = os.environ.get("TEST_NOTIFY") == "1"
+STATE_FILE = "state.txt"
+FAIL_LIMIT = 3      # lecturas fallidas seguidas antes de avisar
+LOWS_TO_CLEAR = 2   # lecturas bajas seguidas para avisar que bajo el viento
+ALERT_KNOTS = 15.0
+COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+KEYS = ["norden", "si"]
+NAMES = {"norden": "Norden", "si": "San Isidro"}
+LOCAL_TZ = timezone(timedelta(hours=-3))  # Argentina, sin horario de verano
+
+# --- Norden (CARP) ---
+URL = "https://www.comisionriodelaplata.org/servicios_main.php?sid=VM"
 MIN_PIXELS = int(os.environ.get("MIN_PIXELS", "300"))
 TOL = 24
-FAIL_LIMIT = 3   # lecturas fallidas seguidas antes de avisar
-LOWS_TO_CLEAR = 2  # lecturas bajas seguidas para avisar que bajo el viento
-
-# Colores de la leyenda (aproximados, tomados de las capturas)
 BINS = {
     "<5": (65, 125, 205),
     "5-10": (16, 26, 62),
@@ -32,8 +44,19 @@ BINS = {
     ">30": (232, 152, 78),
 }
 ALERT_BINS = ["15-20", "20-25", "25-30", ">30"]
-COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+# --- San Isidro (ThingSpeak) ---
+FEED_URL = "https://api.thingspeak.com/channels/1506798/feeds/last.json"
+SPEED_FIELD = "field3"   # Velocidad viento (nudos)
+DIR_FIELD = "field4"     # Direccion viento (grados)
+MAX_AGE_MIN = 60         # minutos maximos de antiguedad del dato
+
+# --- Pronostico (Open-Meteo): latitud, longitud (aproximadas) ---
+FORECAST_POINTS = {
+    "norden": (-34.64, -57.93),
+    "si": (-34.46, -58.51),
+}
+FORECAST_HOURS = 12
 
 
 def notify(msg):
@@ -43,13 +66,18 @@ def notify(msg):
     req = urllib.request.Request(
         f"https://ntfy.sh/{TOPIC}",
         data=msg.encode("utf-8"),
-        headers={"Title": "Viento Norden", "Priority": "high", "Tags": "wind_face"},
+        headers={"Title": "Viento Norden y San Isidro", "Priority": "high",
+                 "Tags": "wind_face"},
     )
     urllib.request.urlopen(req, timeout=20)
 
 
+def compass(deg):
+    return COMPASS[int(round((deg % 360) / 22.5)) % 16]
+
+
+# ---------------- Norden ----------------
 def open_norden(page):
-    # Toca el marcador "Norden": el pin queda justo arriba de su etiqueta
     for frame in page.frames:
         try:
             label = frame.get_by_text("Norden", exact=True).first
@@ -77,7 +105,6 @@ def click_wind(page):
 
 
 def locate_region(page):
-    """Zona de la pagina donde esta la rosa, tomando como guia la leyenda."""
     for frame in page.frames:
         try:
             ref = frame.get_by_text("5-10 knots", exact=True).first
@@ -111,8 +138,7 @@ def capture():
     return region
 
 
-def direction(mask):
-    """Angulo (grados desde el norte, horario) hacia donde apunta la cuña."""
+def wedge_direction(mask):
     ys, xs = np.nonzero(mask)
     if len(xs) < 50:
         return None
@@ -125,7 +151,7 @@ def direction(mask):
     lo = t <= np.percentile(t, 15)
     hi = t >= np.percentile(t, 85)
     if p[lo].std() > p[hi].std():
-        u = -u  # el extremo angosto es el centro de la rosa
+        u = -u
     return math.degrees(math.atan2(u[0], -u[1])) % 360
 
 
@@ -142,86 +168,168 @@ def read_rose(region):
     return result
 
 
-def describe(name, mask):
-    ang = direction(mask)
-    text = f"{name} nudos"
+def get_norden():
+    """Devuelve {'high': bool, 'desc': str} o None si no se pudo leer."""
+    try:
+        region = capture()
+        if region is None:
+            return None
+        result = read_rose(region)
+    except Exception as exc:
+        print("Error leyendo Norden:", exc)
+        return None
+    print("Pixeles por rango:", {k: v[0] for k, v in result.items()})
+    active = {b: result[b][0] for b in BINS if result[b][0] >= MIN_PIXELS}
+    if not active:
+        return None
+    hits = {b: n for b, n in active.items() if b in ALERT_BINS}
+    pick = max(hits, key=hits.get) if hits else max(active, key=active.get)
+    ang = wedge_direction(result[pick][1])
+    desc = f"{pick} nudos"
     if ang is not None:
-        text += f", del {COMPASS[int(round(ang / 22.5)) % 16]}"
+        desc += f", del {compass(ang)}"
+    return {"high": bool(hits), "desc": desc}
+
+
+# ---------------- San Isidro ----------------
+def get_san_isidro():
+    """Devuelve {'high': bool, 'desc': str} o None si no se pudo leer."""
+    try:
+        with urllib.request.urlopen(FEED_URL, timeout=20) as resp:
+            feed = json.load(resp)
+        speed = float(feed[SPEED_FIELD])
+        raw_dir = feed.get(DIR_FIELD)
+        deg = float(raw_dir) if raw_dir not in (None, "") else None
+        when = datetime.fromisoformat(feed["created_at"].replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - when).total_seconds() / 60
+    except Exception as exc:
+        print("Error leyendo San Isidro:", exc)
+        return None
+    print("San Isidro:", speed, deg, "| edad (min):", round(age))
+    if age > MAX_AGE_MIN:
+        print("Dato demasiado viejo, se ignora")
+        return None
+    desc = f"{speed:g} nudos"
+    if deg is not None:
+        desc += f", del {compass(deg)}"
+    return {"high": speed >= ALERT_KNOTS, "desc": desc}
+
+
+# ---------------- Pronostico ----------------
+def get_forecast(lat, lon):
+    """Filas (hora local, nudos, rafagas, direccion) de las proximas horas."""
+    url = ("https://api.open-meteo.com/v1/forecast"
+           f"?latitude={lat}&longitude={lon}"
+           "&hourly=wind_speed_10m,wind_gusts_10m,wind_direction_10m"
+           "&wind_speed_unit=kn&timezone=America%2FArgentina%2FBuenos_Aires"
+           "&forecast_days=2")
+    with urllib.request.urlopen(url, timeout=20) as resp:
+        hourly = json.load(resp)["hourly"]
+    now = datetime.now(LOCAL_TZ).replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    end = now + timedelta(hours=FORECAST_HOURS)
+    rows = []
+    for t, s, g, d in zip(hourly["time"], hourly["wind_speed_10m"],
+                          hourly["wind_gusts_10m"], hourly["wind_direction_10m"]):
+        when = datetime.fromisoformat(t)
+        if now <= when < end and s is not None:
+            rows.append((when, s, g, d))
+    return rows
+
+
+def forecast_text(name, rows):
+    if not rows:
+        return f"{name}: sin pronostico"
+    speeds = [r[1] for r in rows]
+    gusts = [r[2] for r in rows if r[2] is not None]
+    peak = max(rows, key=lambda r: r[1])
+    text = f"{name}: {min(speeds):.0f}-{max(speeds):.0f} nudos"
+    if gusts:
+        text += f", rafagas hasta {max(gusts):.0f}"
+    text += f", pico {peak[1]:.0f} a las {peak[0].hour}h"
+    if peak[3] is not None:
+        text += f" del {compass(peak[3])}"
+    over = [r for r in rows if r[1] >= ALERT_KNOTS]
+    if over:
+        text += f"; 15 o mas desde las {over[0][0].hour}h"
+    else:
+        text += "; sin 15 nudos"
     return text
 
 
+def forecast_block():
+    lines = []
+    for key in KEYS:
+        try:
+            rows = get_forecast(*FORECAST_POINTS[key])
+            lines.append(forecast_text(NAMES[key], rows))
+        except Exception as exc:
+            print("Error de pronostico", key, exc)
+            lines.append(f"{NAMES[key]}: sin pronostico")
+    return f"Pronostico proximas {FORECAST_HOURS} h (modelo):\n" + "\n".join(lines)
+
+
+# ---------------- Estado y avisos ----------------
 def load_state():
-    """Devuelve (estado, fallos seguidos, lecturas bajas seguidas)."""
+    state = {k: {"state": "low", "fails": 0, "lows": 0} for k in KEYS}
     try:
-        parts = open("state.txt").read().split()
-    except FileNotFoundError:
-        parts = []
-    state = parts[0] if parts and parts[0] in ("low", "high") else "low"
-    nums = [int(x) for x in parts[1:3] if x.isdigit()]
-    nums += [0] * (2 - len(nums))
-    return state, nums[0], nums[1]
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        for k in KEYS:
+            state[k].update(data.get(k, {}))
+    except Exception:
+        pass  # archivo ausente o con el formato anterior
+    return state
 
 
-def save_state(state, fails, lows):
-    with open("state.txt", "w") as f:
-        f.write(f"{state} {fails} {lows}")
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def status_lines(readings):
+    return "\n".join(
+        f"{NAMES[k]}: {readings[k]['desc'] if readings[k] else 'sin lectura'}" for k in KEYS
+    )
 
 
 def main():
     if TEST_NOTIFY:
         notify("Prueba: el aviso de viento funciona.")
 
-    state, fails, lows = load_state()
-
-    try:
-        region = capture()
-    except Exception as exc:
-        print("Error al capturar:", exc)
-        region = None
-
-    result, active = {}, {}
-    if region is not None:
-        result = read_rose(region)
-        print("Pixeles por rango:", {k: v[0] for k, v in result.items()})
-        active = {b: result[b][0] for b in BINS if result[b][0] >= MIN_PIXELS}
-
-    dominant = max(active, key=active.get) if active else None
+    state = load_state()
+    readings = {"norden": get_norden(), "si": get_san_isidro()}
 
     if TEST_NOTIFY:
-        if dominant:
-            notify("Prueba - lectura actual: " + describe(dominant, result[dominant][1]))
-        else:
-            notify("Prueba: no pude leer la rosa de vientos.")
+        notify("Prueba - lectura actual:\n" + status_lines(readings)
+               + "\n\n" + forecast_block())
 
-    # Lectura fallida: se cuenta y se avisa una sola vez por racha
-    if dominant is None:
-        fails += 1
-        print("Lectura fallida seguida numero", fails)
-        if fails == FAIL_LIMIT:
-            notify("No puedo leer el viento del Norden desde hace unos 45 minutos. "
-                   "Revisa la pagina de CARP o el script.")
-        save_state(state, fails, lows)
-        return
+    events = []
+    for key in KEYS:
+        st, r = state[key], readings[key]
+        if r is None:
+            st["fails"] += 1
+            print(NAMES[key], "- lectura fallida seguida numero", st["fails"])
+            if st["fails"] == FAIL_LIMIT:
+                events.append(f"No puedo leer {NAMES[key]} desde hace unos 45 minutos.")
+            continue
+        st["fails"] = 0
+        if r["high"]:
+            st["lows"] = 0
+            if st["state"] != "high":
+                st["state"] = "high"
+                events.append(f"{NAMES[key]} subio a 15 nudos o mas.")
+        elif st["state"] == "high":
+            st["lows"] += 1
+            if st["lows"] >= LOWS_TO_CLEAR:
+                st["state"], st["lows"] = "low", 0
+                events.append(f"{NAMES[key]} bajo de 15 nudos.")
 
-    fails = 0
-    alert_hits = {b: n for b, n in active.items() if b in ALERT_BINS}
+    if events:
+        notify("\n".join(events) + "\n" + status_lines(readings)
+               + "\n\n" + forecast_block())
 
-    if alert_hits:
-        lows = 0
-        if state != "high":
-            best = max(alert_hits, key=alert_hits.get)
-            notify("Viento en Pilote Norden: " + describe(best, result[best][1]))
-            state = "high"
-    elif state == "high":
-        lows += 1
-        if lows >= LOWS_TO_CLEAR:
-            notify("Viento en Pilote Norden bajo de 15 nudos: ahora "
-                   + describe(dominant, result[dominant][1]))
-            state = "low"
-            lows = 0
-
-    print("Estado:", state, "| fallos:", fails, "| lecturas bajas:", lows)
-    save_state(state, fails, lows)
+    print("Estado:", state)
+    save_state(state)
 
 
 if __name__ == "__main__":
